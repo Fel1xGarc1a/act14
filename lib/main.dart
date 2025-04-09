@@ -1,122 +1,332 @@
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/material.dart';
+import 'dart:typed_data';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:vibration/vibration.dart';
+import 'firebase_options.dart';
 
-void main() {
-  runApp(const MyApp());
+const String regularChannelId = 'regular_channel';
+const String importantChannelId = 'important_channel';
+
+final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
+    FlutterLocalNotificationsPlugin();
+
+Future<void> _messageHandler(RemoteMessage message) async {
+  print('background message ${message.notification!.body}');
+  await _storeNotification(message);
 }
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+Future<void> _storeNotification(RemoteMessage message) async {
+  final prefs = await SharedPreferences.getInstance();
+  List<String> history = prefs.getStringList('notification_history') ?? [];
+  
+  String notification = '${DateTime.now().toIso8601String()} - ${message.notification?.title ?? ""}: ${message.notification?.body ?? ""}';
+  
+  history.add(notification);
+  if (history.length > 20) {
+    history.removeAt(0);
+  }
+  
+  await prefs.setStringList('notification_history', history);
+}
 
-  // This widget is the root of your application.
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  
+  await Firebase.initializeApp(
+    options: DefaultFirebaseOptions.currentPlatform,
+  );
+  
+  const AndroidNotificationChannel regularChannel = AndroidNotificationChannel(
+    regularChannelId,
+    'Regular Notifications',
+    importance: Importance.defaultImportance,
+    description: 'Channel for regular notifications',
+  );
+  
+  const AndroidNotificationChannel importantChannel = AndroidNotificationChannel(
+    importantChannelId,
+    'Important Notifications',
+    importance: Importance.high,
+    playSound: true,
+    enableVibration: true,
+    description: 'Channel for important notifications',
+  );
+  
+  await flutterLocalNotificationsPlugin
+      .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
+      ?.createNotificationChannel(regularChannel);
+  
+  await flutterLocalNotificationsPlugin
+      .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
+      ?.createNotificationChannel(importantChannel);
+  
+  await flutterLocalNotificationsPlugin.initialize(
+    const InitializationSettings(
+      android: AndroidInitializationSettings('@mipmap/ic_launcher'),
+      iOS: DarwinInitializationSettings(),
+    ),
+    onDidReceiveNotificationResponse: (NotificationResponse response) {
+      print("Notification clicked: ${response.payload}");
+    },
+  );
+  
+  FirebaseMessaging.onBackgroundMessage(_messageHandler);
+  
+  runApp(const MessagingApp());
+}
+
+class MessagingApp extends StatelessWidget {
+  const MessagingApp({Key? key}) : super(key: key);
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Flutter Demo',
+      debugShowCheckedModeBanner: false,
+      title: 'Act14 - Firebase Messaging',
       theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // TRY THIS: Try running your application with "flutter run". You'll see
-        // the application has a purple toolbar. Then, without quitting the app,
-        // try changing the seedColor in the colorScheme below to Colors.green
-        // and then invoke "hot reload" (save your changes or press the "hot
-        // reload" button in a Flutter-supported IDE, or press "r" if you used
-        // the command line to start the app).
-        //
-        // Notice that the counter didn't reset back to zero; the application
-        // state is not lost during the reload. To reset the state, use hot
-        // restart instead.
-        //
-        // This works for code too, not just values: Most code changes can be
-        // tested with just a hot reload.
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
       ),
-      home: const MyHomePage(title: 'Flutter Demo Home Page'),
+      home: const MyHomePage(title: 'Act14 - Firebase Messaging'),
     );
   }
 }
 
 class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title});
-
-  // This widget is the home page of your application. It is stateful, meaning
-  // that it has a State object (defined below) that contains fields that affect
-  // how it looks.
-
-  // This class is the configuration for the state. It holds the values (in this
-  // case the title) provided by the parent (in this case the App widget) and
-  // used by the build method of the State. Fields in a Widget subclass are
-  // always marked "final".
-
+  const MyHomePage({Key? key, required this.title}) : super(key: key);
   final String title;
 
   @override
-  State<MyHomePage> createState() => _MyHomePageState();
+  _MyHomePageState createState() => _MyHomePageState();
 }
 
 class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
+  late FirebaseMessaging messaging;
+  String? fcmToken;
+  List<Map<String, dynamic>> notificationHistory = [];
 
-  void _incrementCounter() {
+  @override
+  void initState() {
+    super.initState();
+    
+    messaging = FirebaseMessaging.instance;
+    _initMessaging();
+    _loadNotificationHistory();
+  }
+
+  Future<void> _initMessaging() async {
+    await messaging.requestPermission(
+      alert: true,
+      badge: true,
+      sound: true,
+    );
+    
+    messaging.getToken().then((token) {
+      print('FCM Token: $token');
+      setState(() {
+        fcmToken = token;
+      });
+    });
+    
+    messaging.subscribeToTopic("messaging");
+    
+    FirebaseMessaging.onMessage.listen((RemoteMessage message) {
+      print('FCM message received: ${message.notification!.body}');
+      
+      showDialog(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: Text(message.notification?.title ?? "Notification"),
+          content: Text(message.notification?.body ?? "No content"),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: Text("OK"),
+            ),
+          ],
+        ),
+      );
+      
+      _storeNotification(message);
+      _loadNotificationHistory();
+      
+      String notificationType = message.data['type'] ?? 'regular';
+      _showLocalNotification(message, notificationType);
+    });
+    
+    FirebaseMessaging.onMessageOpenedApp.listen((RemoteMessage message) {
+      print('Notification clicked: ${message.notification!.body}');
+      
+      String? route = message.data['route'];
+      if (route != null) {
+        print('Should navigate to route: $route');
+      }
+    });
+  }
+
+  void _showLocalNotification(RemoteMessage message, String notificationType) async {
+    String channelId = notificationType == 'important' 
+        ? importantChannelId 
+        : regularChannelId;
+    
+    NotificationDetails details;
+    
+    if (notificationType == 'important') {
+      details = NotificationDetails(
+        android: AndroidNotificationDetails(
+          channelId, 
+          'Important Notifications',
+          importance: Importance.high,
+          priority: Priority.high,
+          icon: '@mipmap/ic_launcher',
+          color: Colors.red,
+          playSound: true,
+          enableVibration: true,
+          vibrationPattern: Int64List.fromList([0, 500, 200, 500]),
+          actions: <AndroidNotificationAction>[
+            AndroidNotificationAction(
+              'open',
+              'Open',
+              showsUserInterface: true,
+            ),
+            AndroidNotificationAction(
+              'dismiss',
+              'Dismiss',
+            ),
+          ],
+        ),
+        iOS: const DarwinNotificationDetails(
+          presentAlert: true,
+          presentBadge: true,
+          presentSound: true,
+        ),
+      );
+    } else {
+      details = NotificationDetails(
+        android: AndroidNotificationDetails(
+          channelId,
+          'Regular Notifications',
+          importance: Importance.defaultImportance,
+          priority: Priority.defaultPriority,
+          icon: '@mipmap/ic_launcher',
+        ),
+        iOS: const DarwinNotificationDetails(),
+      );
+    }
+    
+    await flutterLocalNotificationsPlugin.show(
+      message.hashCode,
+      message.notification?.title ?? 'Notification',
+      message.notification?.body ?? '',
+      details,
+      payload: message.data['route'],
+    );
+  }
+  
+  Future<void> _vibrate() async {
+    if (await Vibration.hasVibrator() ?? false) {
+      Vibration.vibrate(duration: 500);
+    }
+  }
+  
+  Future<void> _loadNotificationHistory() async {
+    final prefs = await SharedPreferences.getInstance();
+    List<String> history = prefs.getStringList('notification_history') ?? [];
+    
     setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
-      _counter++;
+      notificationHistory = history.map((notification) {
+        List<String> parts = notification.split(' - ');
+        String timestamp = parts[0];
+        String content = parts.length > 1 ? parts[1] : '';
+        
+        return {
+          'timestamp': DateTime.parse(timestamp),
+          'content': content,
+        };
+      }).toList();
     });
   }
 
   @override
   Widget build(BuildContext context) {
-    // This method is rerun every time setState is called, for instance as done
-    // by the _incrementCounter method above.
-    //
-    // The Flutter framework has been optimized to make rerunning build methods
-    // fast, so that you can just rebuild anything that needs updating rather
-    // than having to individually change instances of widgets.
     return Scaffold(
       appBar: AppBar(
-        // TRY THIS: Try changing the color here to a specific color (to
-        // Colors.amber, perhaps?) and trigger a hot reload to see the AppBar
-        // change color while the other colors stay the same.
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        // Here we take the value from the MyHomePage object that was created by
-        // the App.build method, and use it to set our appbar title.
         title: Text(widget.title),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.history),
+            onPressed: () => _showNotificationHistory(),
+          ),
+        ],
       ),
       body: Center(
-        // Center is a layout widget. It takes a single child and positions it
-        // in the middle of the parent.
-        child: Column(
-          // Column is also a layout widget. It takes a list of children and
-          // arranges them vertically. By default, it sizes itself to fit its
-          // children horizontally, and tries to be as tall as its parent.
-          //
-          // Column has various properties to control how it sizes itself and
-          // how it positions its children. Here we use mainAxisAlignment to
-          // center the children vertically; the main axis here is the vertical
-          // axis because Columns are vertical (the cross axis would be
-          // horizontal).
-          //
-          // TRY THIS: Invoke "debug painting" (choose the "Toggle Debug Paint"
-          // action in the IDE, or press "p" in the console), to see the
-          // wireframe for each widget.
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: <Widget>[
-            const Text('You have pushed the button this many times:'),
-            Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
-            ),
-          ],
+        child: Padding(
+          padding: const EdgeInsets.all(16.0),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: <Widget>[
+              const Text(
+                'FCM Token:',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+              ),
+              Container(
+                margin: const EdgeInsets.symmetric(vertical: 16),
+                padding: const EdgeInsets.all(8.0),
+                decoration: BoxDecoration(
+                  border: Border.all(color: Colors.grey),
+                  borderRadius: BorderRadius.circular(8.0),
+                ),
+                child: SelectableText(
+                  fcmToken ?? 'Fetching token...',
+                  style: const TextStyle(fontSize: 12),
+                  textAlign: TextAlign.center,
+                ),
+              ),
+            ],
+          ),
         ),
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: const Icon(Icons.add),
-      ), // This trailing comma makes auto-formatting nicer for build methods.
+    );
+  }
+
+  void _showNotificationHistory() {
+    showModalBottomSheet(
+      context: context,
+      builder: (context) {
+        return Padding(
+          padding: const EdgeInsets.all(16.0),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text(
+                'Notification History',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 8),
+              Expanded(
+                child: notificationHistory.isEmpty
+                    ? const Center(child: Text('No notifications yet'))
+                    : ListView.builder(
+                        itemCount: notificationHistory.length,
+                        itemBuilder: (context, index) {
+                          final notification = notificationHistory[index];
+                          return ListTile(
+                            title: Text(notification['content']),
+                            subtitle: Text(
+                              '${notification['timestamp']}',
+                              style: const TextStyle(fontSize: 12),
+                            ),
+                          );
+                        },
+                      ),
+              ),
+            ],
+          ),
+        );
+      },
     );
   }
 }
